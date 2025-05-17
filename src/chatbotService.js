@@ -1,4 +1,5 @@
 import { saveAs } from 'file-saver';
+import { InferenceClient } from "@huggingface/inference";
 
 // Mental health support agent instructions
 const MENTAL_HEALTH_INSTRUCTIONS = `## Role
@@ -58,6 +59,12 @@ const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || "";
 // API endpoint for the Python backend
 const LOCAL_MODEL_API_URL = import.meta.env.VITE_LOCAL_MODEL_API_URL || ""; // Updated to match Python endpoint
 
+// Hugging Face configuration
+const HF_API_KEY = import.meta.env.VITE_HF_API_KEY || "";
+const HF_MODEL_ID = import.meta.env.VITE_HF_MODEL_ID || "HuggingFaceH4/zephyr-7b-beta";
+
+// Create Hugging Face client instance
+const hfInference = new InferenceClient(HF_API_KEY);
 
 // Instructions for Gemini to enhance responses
 const GEMINI_INSTRUCTIONS = `
@@ -157,61 +164,103 @@ export const checkBackendStatus = async () => {
     }
 };
 
-// Function to process inputs through local model first
+// Function to process inputs through Hugging Face model using the official client
 async function processWithLocalModel(userMessage, historyContext, moodContext, isCrisis) {
     try {
-        console.log("Processing with local model...");
+        console.log("Processing with Hugging Face model...");
 
-        // Prepare data for the local model API
-        const requestData = {
-            message: userMessage,
-            history: historyContext,
-            mood: moodContext || null,
-            isCrisis: isCrisis
-        };
+        // Create a comprehensive prompt that includes all context
+        const crisisContext = isCrisis ?
+            "IMPORTANT: This may be a crisis situation. Provide supportive guidance and emphasize professional help." : "";
 
-        // Call the local model API with appropriate error handling
-        const controller = new AbortController();
-        // Increase timeout to 45 seconds for model processing (initial load can be slow)
-        const timeoutId = setTimeout(() => {
-            console.log("Model processing timeout reached, aborting request");
-            controller.abort();
-        }, 45000);
+        // Format conversation history as context
+        const contextPrompt = `${MENTAL_HEALTH_INSTRUCTIONS}
 
-        console.log("Sending request to Python backend:", requestData);
+${crisisContext}
 
-        const response = await fetch(LOCAL_MODEL_API_URL, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            body: JSON.stringify(requestData),
-            credentials: 'omit',
-            mode: 'cors',
-            signal: controller.signal
-        });
+${moodContext || ""}
 
-        clearTimeout(timeoutId);
+Previous conversation:
+${historyContext || "No previous conversation"}
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('Local model API error:', errorText);
-            throw new Error(`Local model API returned ${response.status}: ${errorText}`);
+User: ${userMessage}
+
+Please provide a thoughtful, supportive response:`;
+
+        console.log("Sending request to Hugging Face API using client library");
+
+        try {
+            // Create a AbortController for timeout
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => {
+                console.log("Hugging Face processing timeout reached, aborting request");
+                controller.abort();
+            }, 30000);
+
+            // Use the text generation endpoint
+            const result = await hfInference.textGeneration({
+                model: HF_MODEL_ID,
+                inputs: contextPrompt,
+                parameters: {
+                    max_new_tokens: 500,
+                    temperature: 0.7,
+                    top_p: 0.95,
+                    do_sample: true
+                },
+                signal: controller.signal
+            });
+
+            clearTimeout(timeoutId);
+
+            console.log("Hugging Face response received:", result);
+
+            if (!result || !result.generated_text) {
+                throw new Error("No valid response from Hugging Face");
+            }
+
+            // Extract just the assistant's response (remove the prompt)
+            const generatedText = result.generated_text;
+            const promptLength = contextPrompt.length;
+            const assistantResponse = generatedText.substring(promptLength).trim();
+
+            return assistantResponse || "I'm here to support you. Could you share more about what you're experiencing?";
+
+        } catch (apiError) {
+            // Try fallback to raw API call if the client library method fails
+            console.warn("Client library call failed, trying raw API:", apiError);
+
+            // Fall back to chat completion
+            try {
+                const chatResult = await hfInference.chatCompletion({
+                    model: HF_MODEL_ID,
+                    messages: [
+                        { role: "system", content: MENTAL_HEALTH_INSTRUCTIONS },
+                        { role: "user", content: `${crisisContext}\n\n${moodContext || ""}\n\nPrevious conversation: ${historyContext || "No previous conversation"}\n\n${userMessage}` }
+                    ],
+                    temperature: 0.7,
+                    max_tokens: 500
+                });
+
+                console.log("Hugging Face chat response received:", chatResult);
+
+                if (chatResult && chatResult.choices && chatResult.choices.length > 0) {
+                    return chatResult.choices[0].message.content;
+                }
+
+                throw new Error("No valid chat response from Hugging Face");
+            } catch (chatError) {
+                console.error("Chat completion failed:", chatError);
+                throw chatError;
+            }
         }
-
-        const data = await response.json();
-        console.log("Local model response received:", data);
-        return data.response;
     } catch (error) {
-        console.error("Error processing with local model:", error);
+        console.error("Error processing with Hugging Face model:", error);
 
-        // Add specific handling for connection issues
         if (error.name === 'AbortError') {
-            console.error("Connection to Python server timed out");
+            console.error("Connection to Hugging Face API timed out");
         }
 
-        // If local model fails, return null to fall back to direct Gemini processing
+        // If Hugging Face model fails, return null to fall back to direct Gemini processing
         return null;
     }
 }
@@ -235,7 +284,7 @@ export const chatRequest = async (userMessage, messageHistory = [], mood = null)
         const usePythonModel = backendStatus.isAvailable && backendStatus.modelLoaded;
 
         if (!usePythonModel) {
-            console.log("Python backend unavailable, using direct Gemini fallback");
+            console.log("Python backend unavailable, using Hugging Face or Gemini");
         } else {
             console.log("Python backend available, will try to use local model");
         }
@@ -262,25 +311,31 @@ export const chatRequest = async (userMessage, messageHistory = [], mood = null)
         let finalResponse;
         let localModelUsed = false;
 
-        if (usePythonModel) {
-            console.log("Attempting to use local Python model first");
-            // Step 1: Process with local mental health model
-            const localModelResponse = await processWithLocalModel(userMessage, historyContext, moodContext, isCrisis);
+        // Try Hugging Face model first (regardless of Python backend)
+        if (HF_API_KEY) {
+            console.log("Attempting to use Hugging Face model");
+            try {
+                const hfResponse = await processWithLocalModel(userMessage, historyContext, moodContext, isCrisis);
 
-            // Step 2: Generate final response with Gemini, using local model output as input
-            if (localModelResponse) {
-                console.log("Local model response received, enhancing with Gemini");
-                localModelUsed = true;
-                // If local model provided a response, use Gemini to enhance it
-                finalResponse = await enhanceResponseWithGemini(localModelResponse, userMessage, historyContext, moodContext, isCrisis);
-            } else {
-                console.log("Local model failed, falling back to direct Gemini response");
-                // Fallback to direct Gemini response if local model failed
+                if (hfResponse) {
+                    console.log("Hugging Face model response received, enhancing with Gemini");
+                    localModelUsed = true;
+
+                    // If HF model provided a response, use Gemini to enhance it
+                    finalResponse = await enhanceResponseWithGemini(hfResponse, userMessage, historyContext, moodContext, isCrisis);
+                } else {
+                    console.log("Hugging Face model failed, falling back to direct Gemini response");
+                    // Fallback to direct Gemini response if HF model failed
+                    finalResponse = await generateGeminiResponse(userMessage, historyContext, moodContext, isCrisis);
+                }
+            } catch (hfError) {
+                console.error("Error using Hugging Face model:", hfError);
+                console.log("Falling back to direct Gemini response");
                 finalResponse = await generateGeminiResponse(userMessage, historyContext, moodContext, isCrisis);
             }
         } else {
-            console.log("Using Gemini directly (no Python backend)");
-            // Directly use Gemini if Python backend is unavailable
+            console.log("No Hugging Face API key, using Gemini directly");
+            // Directly use Gemini if no Hugging Face API key
             finalResponse = await generateGeminiResponse(userMessage, historyContext, moodContext, isCrisis);
         }
 
